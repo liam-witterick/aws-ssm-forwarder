@@ -3,6 +3,7 @@
 A small CLI to open **AWS Systems Manager (SSM)** tunnels for:
 - **Generic port forwarding** (`pf`) - to the EC2 instance itself, or to any **remote host** (e.g., an RDS endpoint) *via* the EC2.
 - **SSH via SSM** (`ssh`) - open an SSM tunnel and SSH through it (no public :22 needed).
+- **Interactive SSM shell** (`connect`) - open an SSM session directly to the instance (no SSH, no port forwarding).
 
 ---
 
@@ -85,6 +86,24 @@ ssm-tunnel ssh -i i-0123456789abcdef0 -u ec2-user -k ~/.ssh/key.pem
 #### Example: SSH with custom port and additional command to shell
 ```bash
 ssm-tunnel ssh -i i-0123456789abcdef0 -u ubuntu -k ~/.ssh/my-key.pem -L 2222 -- ls -la
+```
+
+---
+
+### Connect (connect)
+Open an interactive SSM session (shell) to the EC2 instance (no SSH, no port forwarding).
+
+```bash
+ssm-tunnel connect -i <INSTANCE_ID> [--profile <PROFILE>] [--region <REGION>]
+```
+
+- `-i, --instance <id>`: EC2 instance ID (**required**)
+- `--profile <profile>`: AWS CLI profile
+- `--region <region>`: AWS region
+
+#### Example: Open an SSM session to the instance
+```bash
+ssm-tunnel connect -i i-0123456789abcdef0 --profile prod
 ```
 
 ---

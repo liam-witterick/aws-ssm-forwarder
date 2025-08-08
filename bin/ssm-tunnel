@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ssm-tunnel — tidy SSM tunneling CLI with subcommands
+# ssm-tunnel - tidy SSM tunneling CLI with subcommands
 # Subcommands:
 #   pf   : port-forward to the EC2 itself OR to a remote host (e.g., RDS) via the EC2
 #   ssh  : port-forward to EC2:22 then SSH through it
@@ -74,6 +74,7 @@ Usage:
                   [--remote-host <HOST>] [--profile <PROFILE>] [--region <REGION>] [--print-port]
   ssm-tunnel ssh  -i <INSTANCE_ID> -u <USER> [-k <KEY>] [-L <LOCAL_PORT>]
                   [--profile <PROFILE>] [--region <REGION>] [-- ...ssh args]
+  ssm-tunnel connect -i <INSTANCE_ID> [--profile <PROFILE>] [--region <REGION>]
 
 Notes:
   - Region precedence: --region > profile's region > AWS_REGION/AWS_DEFAULT_REGION
@@ -88,6 +89,9 @@ Examples:
 
   # SSH via SSM (no public 22)
   ssm-tunnel ssh -i i-0123 -u ubuntu -k ~/.ssh/id_rsa --profile prod
+
+  # Open an interactive SSM session (no SSH, no port forwarding)
+  ssm-tunnel connect -i i-0123 --profile prod
 USAGE
 }
 
@@ -195,12 +199,44 @@ cmd_ssh(){
   ssh "${args[@]}" "$@"
 }
 
+# ---- connect subcommand ----
+cmd_connect(){
+  local instance="" region_override="" profile_override=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i|--instance) instance="${2:-}"; shift 2 ;;
+      --profile) profile_override="${2:-}"; shift 2 ;;
+      --region)  region_override="${2:-}"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "connect: unknown arg $1" ;;
+    esac
+  done
+  [[ -n "$instance" ]] || die "connect: --instance required"
+
+  # Avoid empty env profiles
+  [[ "${AWS_PROFILE-__unset__}" = "" ]] && unset AWS_PROFILE
+  [[ "${AWS_DEFAULT_PROFILE-__unset__}" = "" ]] && unset AWS_DEFAULT_PROFILE
+
+  PROFILE="${profile_override:-${AWS_PROFILE:-${AWS_DEFAULT_PROFILE:-}}}"
+  REGION="$(resolve_region "$region_override" "$PROFILE")"
+  have aws || die "aws cli not found"
+  have session-manager-plugin || die "session-manager-plugin not found"
+  [[ -n "$REGION" ]] || die "No region configured. Use --region, set profile region, or export AWS_REGION."
+
+  AWS_ARGS=()
+  [[ -n "$REGION" ]] && AWS_ARGS+=(--region "$REGION")
+  [[ -n "$PROFILE" ]] && AWS_ARGS+=(--profile "$PROFILE")
+
+  exec aws "${AWS_ARGS[@]}" ssm start-session --target "$instance"
+}
+
 # ---- dispatch ----
 [[ $# -lt 1 ]] && { usage; exit 1; }
 sub="$1"; shift || true
 case "$sub" in
   pf)  cmd_pf "$@" ;;
   ssh) cmd_ssh "$@" ;;
+  connect) cmd_connect "$@" ;;
   -h|--help|help) usage ;;
   *) die "Unknown subcommand: $sub" ;;
 esac
