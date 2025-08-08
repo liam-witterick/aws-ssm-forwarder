@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# ssm-tunnel — tidy SSM tunneling CLI with subcommands
+# Subcommands:
+#   pf   : port-forward to the EC2 itself OR to a remote host (e.g., RDS) via the EC2
+#   ssh  : port-forward to EC2:22 then SSH through it
+#
+# Region precedence: --region > profile's region > AWS_REGION/AWS_DEFAULT_REGION
+set -euo pipefail
+
+PROFILE=""
+REGION=""
+LOG_FILE=""
+TUNNEL_PID=""
+
+die(){ echo "Error: $*" >&2; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+pick_port(){ while :; do p=$(( (RANDOM%55512)+10000 )); (echo >"/dev/tcp/127.0.0.1/$p") >/dev/null 2>&1 || { echo "$p"; return; }; done; }
+aws_args(){ local a=(); [[ -n "$REGION" ]] && a+=(--region "$REGION"); [[ -n "$PROFILE" ]] && a+=(--profile "$PROFILE"); printf '%q ' "${a[@]}"; }
+resolve_region(){
+  local explicit="$1" prof="$2"
+  [[ -n "$explicit" ]] && { echo "$explicit"; return; }
+  if [[ -n "$prof" ]]; then
+    local r; r="$(aws configure get region --profile "$prof" 2>/dev/null || true)"
+    [[ -n "$r" ]] && { echo "$r"; return; }
+  fi
+  [[ -n "${AWS_REGION-}" ]] && { echo "$AWS_REGION"; return; }
+  [[ -n "${AWS_DEFAULT_REGION-}" ]] && { echo "$AWS_DEFAULT_REGION"; return; }
+  echo ""
+}
+wait_port(){
+  local port="$1" timeout="${2:-25}" start ts
+  start=$(date +%s)
+  while :; do
+    (echo >"/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1 && return 0 || true
+    ts=$(date +%s); (( ts-start >= timeout )) && return 1
+    sleep 0.25
+  done
+}
+start_tunnel(){
+  local instance="$1" lport="$2" rport="$3" host="$4"
+  LOG_FILE="$(mktemp -t ssm-tunnel.XXXXXX.log)"
+  local doc="AWS-StartPortForwardingSession"
+  local params="{\"portNumber\":[\"$rport\"], \"localPortNumber\":[\"$lport\"]}"
+  if [[ -n "$host" ]]; then
+    doc="AWS-StartPortForwardingSessionToRemoteHost"
+    params="{\"portNumber\":[\"$rport\"], \"localPortNumber\":[\"$lport\"], \"host\":[\"$host\"]}"
+  fi
+  # shellcheck disable=SC2046
+  nohup aws $(aws_args) ssm start-session \
+    --target "$instance" \
+    --document-name "$doc" \
+    --parameters "$params" \
+    >"$LOG_FILE" 2>&1 < /dev/null &
+  TUNNEL_PID=$!
+}
+cleanup(){
+  [[ -n "${TUNNEL_PID:-}" ]] && kill "$TUNNEL_PID" >/dev/null 2>&1 || true
+  [[ -n "${LOG_FILE:-}" ]] && rm -f "$LOG_FILE" || true
+}
+trap cleanup EXIT
+
+prechecks(){
+  have aws || die "aws cli not found"
+  have session-manager-plugin || die "session-manager-plugin not found"
+  [[ -n "$REGION" ]] || die "No region configured. Use --region, set profile region, or export AWS_REGION."
+  # shellcheck disable=SC2046
+  aws $(aws_args) sts get-caller-identity >/dev/null 2>&1 || die "AWS auth/region invalid for profile='${PROFILE:-<default>}' region='$REGION'."
+}
+
+usage(){
+cat <<'USAGE'
+Usage:
+  ssm-tunnel pf   -i <INSTANCE_ID> [-r <REMOTE_PORT>] [-L <LOCAL_PORT>]
+                  [--remote-host <HOST>] [--profile <PROFILE>] [--region <REGION>] [--print-port]
+  ssm-tunnel ssh  -i <INSTANCE_ID> -u <USER> [-k <KEY>] [-L <LOCAL_PORT>]
+                  [--profile <PROFILE>] [--region <REGION>] [-- ...ssh args]
+
+Notes:
+  - Region precedence: --region > profile's region > AWS_REGION/AWS_DEFAULT_REGION
+  - 'pf' forwards to the EC2 itself by default, or to a remote host (e.g., RDS) if --remote-host is set.
+  - --print-port prints just the chosen local port to stdout (useful for scripts).
+Examples:
+  # Forward laptop:15432 -> EC2:5432
+  ssm-tunnel pf -i i-0123 -r 5432 -L 15432
+
+  # Forward to RDS via EC2 (uses ToRemoteHost)
+  ssm-tunnel pf -i i-0123 --remote-host mydb.x.rds.amazonaws.com -r 5432 --print-port
+
+  # SSH via SSM (no public 22)
+  ssm-tunnel ssh -i i-0123 -u ubuntu -k ~/.ssh/id_rsa --profile prod
+USAGE
+}
+
+# ---- pf subcommand ----
+cmd_pf(){
+  local instance="" rport="22" lport="" remote_host="" region_override="" profile_override="" print_port=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i|--instance) instance="${2:-}"; shift 2 ;;
+      -r|--remote-port) rport="${2:-}"; shift 2 ;;
+      -L|--local-port)  lport="${2:-}"; shift 2 ;;
+      --remote-host)    remote_host="${2:-}"; shift 2 ;;
+      --region) region_override="${2:-}"; shift 2 ;;
+      --profile) profile_override="${2:-}"; shift 2 ;;
+      --print-port) print_port=true; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "pf: unknown arg $1" ;;
+    esac
+  done
+  [[ -n "$instance" ]] || die "pf: --instance required"
+
+  # Avoid empty env profiles
+  [[ "${AWS_PROFILE-__unset__}" = "" ]] && unset AWS_PROFILE
+  [[ "${AWS_DEFAULT_PROFILE-__unset__}" = "" ]] && unset AWS_DEFAULT_PROFILE
+
+  PROFILE="${profile_override:-${AWS_PROFILE:-${AWS_DEFAULT_PROFILE:-}}}"
+  REGION="$(resolve_region "$region_override" "$PROFILE")"
+  prechecks
+
+  [[ -n "$lport" ]] || lport="$(pick_port)"
+
+  # Warn-only preflight
+  aws $(aws_args) ssm describe-instance-information \
+    --filters "Key=InstanceIds,Values=$instance" \
+    --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null \
+    | grep -q Online || echo "Preflight: instance not Online in SSM (continuing)..." >&2
+
+  start_tunnel "$instance" "$lport" "$rport" "$remote_host"
+
+  if ! wait_port "$lport" 25; then
+    echo "Failed to open local port $lport. Tail of log:" >&2
+    tail -n +1 "$LOG_FILE" >&2 || true
+    if grep -q 'TargetNotConnected' "$LOG_FILE" 2>/dev/null; then
+      cat >&2 <<'EOF'
+SSM: TargetNotConnected — instance isn't connected to SSM.
+Check: Agent running, instance profile AmazonSSMManagedInstanceCore, egress/VPC endpoints (ssm, ssmmessages, ec2messages), instance running/region.
+EOF
+    fi
+    exit 1
+  fi
+
+  $print_port && echo "$lport"
+  local target_desc
+  if [[ -n "$remote_host" ]]; then
+    target_desc="$remote_host:$rport via instance $instance"
+  else
+    target_desc="instance $instance:$rport"
+  fi
+  echo "Tunnel: localhost:$lport → $target_desc (profile='${PROFILE:-<default>}', region='$REGION')" >&2
+  echo "Ctrl+C to close." >&2
+  wait
+}
+
+# ---- ssh subcommand ----
+cmd_ssh(){
+  local instance="" user="" key="" region_override="" profile_override="" lport=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i|--instance) instance="${2:-}"; shift 2 ;;
+      -u|--user)     user="${2:-}"; shift 2 ;;
+      -k|--key)      key="${2:-}"; shift 2 ;;
+      -L|--local-port) lport="${2:-}"; shift 2 ;;
+      --region) region_override="${2:-}"; shift 2 ;;
+      --profile) profile_override="${2:-}"; shift 2 ;;
+      --) shift; break ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "ssh: unknown arg $1" ;;
+    esac
+  done
+  [[ -n "$instance" ]] || die "ssh: --instance required"
+  [[ -n "$user"     ]] || die "ssh: --user required"
+  have ssh || die "ssh not found"
+
+  [[ "${AWS_PROFILE-__unset__}" = "" ]] && unset AWS_PROFILE
+  [[ "${AWS_DEFAULT_PROFILE-__unset__}" = "" ]] && unset AWS_DEFAULT_PROFILE
+
+  PROFILE="${profile_override:-${AWS_PROFILE:-${AWS_DEFAULT_PROFILE:-}}}"
+  REGION="$(resolve_region "$region_override" "$PROFILE")"
+  prechecks
+
+  [[ -n "$lport" ]] || lport="$(pick_port)"
+  start_tunnel "$instance" "$lport" "22" ""
+
+  if ! wait_port "$lport" 25; then
+    echo "Failed to open local port $lport. Tail of log:" >&2
+    tail -n +1 "$LOG_FILE" >&2 || true
+    exit 1
+  fi
+
+  echo "SSH via tunnel: localhost:$lport → $instance:22 (profile='${PROFILE:-<default>}', region='$REGION')" >&2
+  local args=(-p "$lport" "$user@127.0.0.1" -o StrictHostKeyChecking=accept-new)
+  [[ -n "$key" ]] && args=(-i "$key" "${args[@]}")
+  ssh "${args[@]}" "$@"
+}
+
+# ---- dispatch ----
+[[ $# -lt 1 ]] && { usage; exit 1; }
+sub="$1"; shift || true
+case "$sub" in
+  pf)  cmd_pf "$@" ;;
+  ssh) cmd_ssh "$@" ;;
+  -h|--help|help) usage ;;
+  *) die "Unknown subcommand: $sub" ;;
+esac
