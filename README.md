@@ -9,11 +9,18 @@ A small CLI to open **AWS Systems Manager (SSM)** tunnels for:
 ## Requirements
 
 - AWS CLI v2
-- `ssh` (for SSH subcommand)
+- AWS Credentials / Profiles configured
 - EC2 instance:
   - SSM Agent installed and running
   - Instance profile attached with `AmazonSSMManagedInstanceCore`
   - Network egress or VPC endpoints for `ssm`, `ssmmessages`, `ec2messages`
+
+ For SSH subcommand:
+  - `ssh`
+  - Appropriate credentials, i.e username and private key
+
+For PF subcommand: 
+  - EC2 instance (jumpbox) must have network connectivty to remote host (e.g. RDS instance)
 
 ---
 
